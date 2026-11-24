@@ -1,0 +1,8 @@
+.env*
+*API_KEY*
+__pycache__/
+.ipynb_checkpoints/
+01_data/
+* input/
+추적입력/
+~$*
