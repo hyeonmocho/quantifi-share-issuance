@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 base = Path(__file__).resolve().parent
 raw = Path(os.environ.get('CSI_INPUT', base))
-supp = base/'추적입력'
+supp = Path(os.environ.get('CSI_QUOTES',base/'추적입력')).resolve()
 out = base/'성과'
 out.mkdir(exist_ok=True)
 nb = json.loads((base/'CSI_strategy.ipynb').read_text(encoding='utf-8'))
@@ -20,7 +20,8 @@ published_nav=9.913986
 print('재실행 NAV',nav.tail(),flush=True)
 saved_may_aug=np.array([.102866,.038258,.051136,.006728])
 assert np.allclose(hist.iloc[-4:],saved_may_aug,atol=1e-5), hist.tail()
-pd.DataFrame({'return':hist,'nav':nav}).to_csv(out/'검증기간_월말NAV.csv',index_label='date')
+if '--daily' not in sys.argv:
+    pd.DataFrame({'return':hist,'nav':nav}).to_csv(out/'검증기간_월말NAV.csv',index_label='date')
 # 8월 OOS 마감이 3개월 전략의 리밸런싱 주기를 강제로 재설정하지 않도록
 # 마지막 정상 분기의 시작 상태로 돌아간 후, 원래 일정대로 각 분기를 재평가한다.
 state={w['port']:w for w in logs if w['end']==hist.index[-1]}
@@ -31,9 +32,25 @@ if '--history' in sys.argv:
 from concurrent.futures import ThreadPoolExecutor
 import requests, time
 cut=pd.Timestamp('2026-08-31')
-asof=pd.Timestamp(os.environ.get('TRACK_END','2026-11-24'))
+asof=pd.Timestamp('2026-11-24')
+live = '--daily' in sys.argv
+from market_close import market_dates
+markets = market_dates('2026-11-20', os.environ['KRX_KEY_FILE'], supp/'거래소') if live else {}
+last_market = max(markets, default=asof)
+through = max(asof,last_market) if live else asof
 px=pd.read_parquet(supp/'수정주가.parquet')
 cap=pd.read_parquet(supp/'시총_백만원.parquet')
+codes=pd.read_csv(supp/'종목매핑.csv',dtype=str).drop_duplicates('name',keep='first').set_index('name').code.to_dict()
+if live:
+    if px.index[-1] != cap.index[-1]:
+        raise ValueError('신호용 시총과 수정주가 기준일 불일치')
+    for day, market in markets.items():
+        if day <= px.index[-1]:
+            continue
+        by_name = market.reindex([codes.get(n) for n in px.columns]).set_axis(px.columns)
+        reference = by_name.TDD_CLSPRC - by_name.CMPPREVDD_PRC
+        px.loc[day] = px.iloc[-1] * by_name.TDD_CLSPRC.div(reference.where(reference.gt(0)))
+        cap.loc[day] = market.MKTCAP.reindex([codes.get(n) for n in cap.columns]).to_numpy()/1e6
 def extend(old,new,anchor,scale):
     # 같은 날의 가격으로 수정계수 기준일을 맞춘 뒤 후속 수익률만 연결한다.
     if scale:
@@ -59,7 +76,7 @@ needed=set()
 for w in state.values():
     for key in ['prev_long_w','prev_short_w','hold_long','hold_short']:
         needed.update(w[key].keys())
-for date in pd.date_range(cut,'2026-10-31',freq='ME'):
+for date in pd.date_range(cut,through-pd.Timedelta(days=1),freq='ME'):
     l,s=select_candidates(date,params)
     needed.update(l[:n]+s[:n])
 codes=pd.read_csv(supp/'종목매핑.csv',dtype=str).drop_duplicates('name',keep='first').set_index('name').code.to_dict()
@@ -111,18 +128,23 @@ for name,quote in data.items():
         raise ValueError(('FnGuide 교차검증 실패',name))
     series=quote.adj/quote.at[last_total,'adj']*adj_close.at[last_total,name]
     closing=local_close.loc[local_close.name.eq(name)].set_index('date').close
+    if live and closing.empty and asof in markets:
+        closing=pd.Series({d: m.at[codes[name],'TDD_CLSPRC'] for d,m in markets.items() if codes[name] in m.index})
     prev=asof-pd.offsets.BDay(1)
     assert prev in series and closing.loc[prev]>0 and closing.loc[asof]>0,name
     krx=float(str(official.at[codes[name],'TDD_CLSPRC']).replace(',',''))
     assert abs(closing.loc[prev]/krx-1)<.0001,(name,closing.loc[prev],krx)
     # 국내 장 마감 확정 종가. 전날 배당조정 평가액에 오늘 가격 등락률을 연결한다.
     series.loc[asof]=series.loc[prev]*closing.loc[asof]/closing.loc[prev]
+    if live and through > asof:
+        from daily_quotes import extend_total_return
+        series=extend_total_return(series.loc[:asof],codes[name],markets,asof,through,supp/'후속시세')
     active=active.reindex(active.index.union(series.index[series.index>last_total]))
     active.loc[series.index[series.index>last_total],name]=series.loc[series.index>last_total]
     audit.append((name,'배당조정 시세 · 마지막 날 국내 종가',len(diff),diff.abs().max()))
-pd.DataFrame(audit,columns=['name','source','overlap_returns','max_abs_diff']).to_csv(out/'시세점검.csv',index=False)
+audit_frame=pd.DataFrame(audit,columns=['name','source','overlap_returns','max_abs_diff'])
 print('coverage',pd.Series([x[1] for x in audit]).value_counts().to_dict(),flush=True)
-adj_close=active.loc[:asof].dropna(how='all')
+adj_close=active.loc[:through].dropna(how='all')
 exec(src(13)); exec(src(15))
 cal=adj_close.index
 last=cal[-1]
@@ -158,7 +180,19 @@ flat_within_month=(flat+1).groupby(group).cumprod().mean(axis=1)
 daily['카프로가격손익제외']=flat_within_month/flat_within_month.groupby(group).shift().fillna(1)-1
 for month,g in daily.groupby(group):
     assert abs((g['return']+1).prod()-(g[['port_A','port_B','port_C']]+1).prod().mean())<1e-10
-daily.to_csv(out/'추적_일별수익률_NAV.csv',index_label='date',encoding='utf-8-sig')
+path=out/'추적_일별수익률_NAV.csv'
+if live and path.exists():
+    previous=pd.read_csv(path,index_col='date',parse_dates=True)
+    if not previous.index.isin(daily.index).all() or not np.allclose(previous,daily.loc[previous.index,previous.columns],atol=1e-8,rtol=0):
+        raise ValueError('기발표 NAV와 불일치. 원장 갱신 보류')
+    if daily.index[-1]==previous.index[-1]:
+        print('새 공식 거래일 없음:',previous.index[-1].date())
+        sys.exit()
+    daily=pd.concat([previous,daily.loc[daily.index>previous.index[-1]]])
+temp=path.with_suffix('.tmp')
+daily.to_csv(temp,index_label='date',encoding='utf-8-sig')
+temp.replace(path)
+audit_frame.to_csv(out/'시세점검.csv',index=False)
 pd.DataFrame(holdings,columns=['port','signal','side','name','leg_weight']).to_csv(out/'추적_리밸런싱.csv',index=False)
 print(daily.tail().to_string(),flush=True)
 
