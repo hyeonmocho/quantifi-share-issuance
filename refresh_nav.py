@@ -11,7 +11,8 @@ import sys
 ROOT=Path(__file__).resolve().parent
 
 def run(args, **kw):
-    return subprocess.run(args,cwd=ROOT,check=True,encoding='utf-8',errors='replace',**kw)
+    return subprocess.run(args,cwd=ROOT,check=True,encoding='utf-8',errors='replace',
+                          creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),**kw)
 
 def git(*args):
     return run(['git',*args],capture_output=True).stdout.strip()
